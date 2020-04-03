@@ -1,11 +1,16 @@
 using FluentAssertions;
+using Nethereum.ABI.FunctionEncoding;
 using Nethereum.Commerce.ContractDeployments.IntegrationTests.Config;
 using Nethereum.Commerce.Contracts.BusinessPartnerStorage.ContractDefinition;
-using Nethereum.Commerce.Contracts.PoStorage.ContractDefinition;
+using Nethereum.Contracts;
+using System;
 using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
 using Xunit;
 using Xunit.Abstractions;
-using static Nethereum.Commerce.Contracts.ContractEnums;
+using static Nethereum.Commerce.ContractDeployments.IntegrationTests.PoTestHelpers;
+using static Nethereum.Commerce.Contracts.PurchasingExtensions;
 
 namespace Nethereum.Commerce.ContractDeployments.IntegrationTests
 {
@@ -24,38 +29,167 @@ namespace Nethereum.Commerce.ContractDeployments.IntegrationTests
         }
 
         [Fact]
-        public async void ShouldStoreAndRetrieveSeller()
+        public async void ShouldStoreRetrieveAndChangeSeller()
         {
-            var sellerContractAddress = _contracts.Deployment.WalletSellerService.ContractHandler.ContractAddress;
+            var sellerAdminContractAddress = _contracts.Deployment.SellerAdminService.ContractHandler.ContractAddress;
 
             // Create a Seller to store
             var sellerExpected = new Seller()
             {
-                SellerId = "SellerToTest",
-                SellerDescription = _contracts.Deployment.ContractDeploymentConfig.EShopDescription,
-                ContractAddress = sellerContractAddress,
-                ApproverAddress = _contracts.Deployment.ContractDeploymentConfig.EShopApproverAddress,
-                IsActive = true
+                SellerId = "SellerToTest" + GetRandomString(),
+                SellerDescription = "SellerDescription",
+                AdminContractAddress = sellerAdminContractAddress,
+                IsActive = true,
+                CreatedByAddress = string.Empty // filled by contract
             };
 
             // Store Seller
-            var txReceipt = await _contracts.Deployment.BusinessPartnerStorageService.SetSellerRequestAndWaitForReceiptAsync(sellerExpected);
-            txReceipt.Status.Value.Should().Be(1);
+            var txReceiptCreate = await _contracts.Deployment.BusinessPartnerStorageService.SetSellerRequestAndWaitForReceiptAsync(sellerExpected);
+            txReceiptCreate.Status.Value.Should().Be(1);
+
+            // Check Seller create events
+            var logSellerCreateEvent = txReceiptCreate.DecodeAllEvents<SellerCreatedLogEventDTO>().FirstOrDefault();
+            logSellerCreateEvent.Should().NotBeNull();
+            logSellerCreateEvent.Event.SellerId.ConvertToString().Should().Be(sellerExpected.SellerId);
 
             // Retrieve Seller
             var sellerActual = (await _contracts.Deployment.BusinessPartnerStorageService.GetSellerQueryAsync(sellerExpected.SellerId)).Seller;
 
             // They should be the same
-            CheckEverySellerFieldMatches(sellerExpected, sellerActual);
+            CheckEverySellerFieldMatches(sellerExpected, sellerActual, createdByAddress: _contracts.Web3.TransactionManager.Account.Address);
+
+            // Change Seller
+            sellerExpected.SellerDescription = "New description";
+            var txReceiptChange = await _contracts.Deployment.BusinessPartnerStorageService.SetSellerRequestAndWaitForReceiptAsync(sellerExpected);
+            txReceiptChange.Status.Value.Should().Be(1);
+
+            // Check Seller change events
+            var logSellerChangeEvent = txReceiptChange.DecodeAllEvents<SellerChangedLogEventDTO>().FirstOrDefault();
+            logSellerChangeEvent.Should().NotBeNull();
+            logSellerChangeEvent.Event.SellerId.ConvertToString().Should().BeEquivalentTo(sellerExpected.SellerId);
+
+            // Retrieve the updated Seller
+            var sellerActualPostChange = (await _contracts.Deployment.BusinessPartnerStorageService.GetSellerQueryAsync(sellerExpected.SellerId)).Seller;
+
+            // Check seller values match
+            CheckEverySellerFieldMatches(sellerExpected, sellerActualPostChange, createdByAddress: _contracts.Web3.TransactionManager.Account.Address);
         }
 
-        private static void CheckEverySellerFieldMatches(Seller sellerExpected, Seller sellerActual)
+        [Fact]
+        public async void ShouldStoreRetrieveAndChangeEshop()
         {
-            sellerActual.SellerId.Should().Be(sellerExpected.SellerId);
-            sellerActual.SellerDescription.Should().Be(sellerExpected.SellerDescription);
-            sellerActual.ContractAddress.Should().Be(sellerExpected.ContractAddress);
-            sellerActual.ApproverAddress.Should().Be(sellerExpected.ApproverAddress);
-            sellerActual.IsActive.Should().Be(sellerExpected.IsActive);
+            await Task.Delay(1);
+            // Create an eShop to store
+            var eShopExpected = new Eshop()
+            {
+                EShopId = "eShopToTest" + GetRandomString(),
+                EShopDescription = "eShopDescription",
+                PurchasingContractAddress = "0x94618601FE6cb8912b274E5a00453949A57f8C1e",
+                IsActive = true,
+                CreatedByAddress = string.Empty,  // filled by contract
+                QuoteSignerCount = 2,
+                QuoteSigners = new List<string>()
+                {
+                    "0x32A555F2328e85E489f9a5f03669DC820CE7EBe9",
+                    "0x94618601FE6cb8912b274E5a00453949A57f8C1e"
+                }
+            };
+
+            // Store eShop
+            var txReceiptCreate = await _contracts.Deployment.BusinessPartnerStorageService.SetEshopRequestAndWaitForReceiptAsync(eShopExpected);
+            txReceiptCreate.Status.Value.Should().Be(1);
+
+            // Check eShop create events
+            var logEshopCreateEvent = txReceiptCreate.DecodeAllEvents<EshopCreatedLogEventDTO>().FirstOrDefault();
+            logEshopCreateEvent.Should().NotBeNull();
+            logEshopCreateEvent.Event.EShopId.ConvertToString().Should().Be(eShopExpected.EShopId);
+
+            // Retrieve eShop
+            var eShopActual = (await _contracts.Deployment.BusinessPartnerStorageService.GetEshopQueryAsync(eShopExpected.EShopId)).EShop;
+
+            // They should be the same
+            CheckEveryEshopFieldMatches(eShopExpected, eShopActual, createdByAddress: _contracts.Web3.TransactionManager.Account.Address);
+
+            // Change eShop
+            eShopExpected.EShopDescription = "New description";
+            var txReceiptChange = await _contracts.Deployment.BusinessPartnerStorageService.SetEshopRequestAndWaitForReceiptAsync(eShopExpected);
+            txReceiptChange.Status.Value.Should().Be(1);
+
+            // Check eShop change events
+            var logEshopChangeEvent = txReceiptCreate.DecodeAllEvents<EshopCreatedLogEventDTO>().FirstOrDefault();
+            logEshopChangeEvent.Should().NotBeNull();
+            logEshopChangeEvent.Event.EShopId.ConvertToString().Should().BeEquivalentTo(eShopExpected.EShopId);
+
+            // Retrieve the updated eShop
+            var eShopActualPostChange = (await _contracts.Deployment.BusinessPartnerStorageService.GetEshopQueryAsync(eShopExpected.EShopId)).EShop;
+
+            // Check eshop values match
+            CheckEveryEshopFieldMatches(eShopExpected, eShopActualPostChange, createdByAddress: _contracts.Web3.TransactionManager.Account.Address);
+        }
+
+        [Fact]
+        public async void ShouldFailToCreateEshopWhenMissingPurchasingAddress()
+        {
+            await Task.Delay(1);
+            // Create an eShop to store, but miss out required field PurchasingContractAddress            
+            var eShopExpected = new Eshop()
+            {
+                EShopId = "eShopToTest" + GetRandomString(),
+                EShopDescription = "eShopDescription",
+                PurchasingContractAddress = string.Empty,  // causes error
+                IsActive = true,
+                CreatedByAddress = string.Empty,           // filled by contract
+                QuoteSignerCount = 0,                      // filled by contract
+                QuoteSigners = new List<string>()
+                {
+                    "0x32A555F2328e85E489f9a5f03669DC820CE7EBe9",
+                    "0x94618601FE6cb8912b274E5a00453949A57f8C1e"
+                }
+            };
+
+            // Try to store eShop, it should fail
+            Func<Task> act = async () => await _contracts.Deployment.BusinessPartnerStorageService.SetEshopRequestAndWaitForReceiptAsync(eShopExpected);
+            act.Should().Throw<SmartContractRevertException>().WithMessage(BP_EXCEPTION_ESHOP_MISSING_PURCH_CONTRACT);
+        }
+
+        [Fact]
+        public async void ShouldFailToCreateEshopWhenMissingSigners()
+        {
+            await Task.Delay(1);
+            // Create an eShop to store, but miss out all quote signers            
+            var eShopExpected = new Eshop()
+            {
+                EShopId = "eShopToTest" + GetRandomString(),
+                EShopDescription = "eShopDescription",
+                PurchasingContractAddress = "0x32A555F2328e85E489f9a5f03669DC820CE7EBe9",
+                IsActive = true,
+                CreatedByAddress = string.Empty,       // filled by contract
+                QuoteSignerCount = 0,                  // filled by contract
+                QuoteSigners = new List<string>() { }  // causes error
+            };
+
+            // Try to store eShop, it should fail
+            Func<Task> act = async () => await _contracts.Deployment.BusinessPartnerStorageService.SetEshopRequestAndWaitForReceiptAsync(eShopExpected);
+            act.Should().Throw<SmartContractRevertException>().WithMessage(BP_EXCEPTION_ESHOP_MISSING_SIGNERS);
+        }
+
+        [Fact]
+        public async void ShouldFailToCreateSellerWhenMissingAdminAddress()
+        {
+            await Task.Delay(1);
+            // Create a Seller to store, but miss out required field adminContractAddress            
+            var sellerExpected = new Seller()
+            {
+                SellerId = "Seller" + GetRandomString(),
+                SellerDescription = "SellerDescription",
+                AdminContractAddress = string.Empty,  // causes error
+                IsActive = true,
+                CreatedByAddress = string.Empty       // filled by contract
+            };
+
+            // Try to store Seller, it should fail
+            Func<Task> act = async () => await _contracts.Deployment.BusinessPartnerStorageService.SetSellerRequestAndWaitForReceiptAsync(sellerExpected);
+            act.Should().Throw<SmartContractRevertException>().WithMessage(BP_EXCEPTION_SELLER_MISSING_CONTRACT);
         }
     }
 }

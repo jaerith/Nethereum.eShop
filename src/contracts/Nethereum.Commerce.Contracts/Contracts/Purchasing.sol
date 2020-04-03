@@ -2,13 +2,12 @@ pragma solidity ^0.6.1;
 pragma experimental ABIEncoderV2;
 
 import "./IPurchasing.sol";
+import "./ISellerAdmin.sol";
 import "./IPoTypes.sol";
 import "./IErc20.sol";
 import "./IPoStorage.sol";
 import "./IBusinessPartnerStorage.sol";
 import "./IFunding.sol";
-import "./IWalletBuyer.sol";
-import "./IWalletSeller.sol";
 import "./IAddressRegistry.sol";
 import "./Ownable.sol";
 import "./Bindable.sol";
@@ -17,14 +16,21 @@ import "./StringConvertible.sol";
 /// @title Purchasing
 contract Purchasing is IPurchasing, Ownable, Bindable, StringConvertible
 {
+    bytes32 public eShopId;
     IAddressRegistry public addressRegistry;
     IPoStorage public poStorage;
     IBusinessPartnerStorage public bpStorage;
     IFunding public funding;
-   
-    constructor (address contractAddressOfRegistry) public
+    
+    // TODO define where these config values should be held, eternal storage?
+    uint constant private FEE_BASIS_POINTS = 100;  // 100 basis points = 1%
+    uint constant private ESCROW_TIMEOUT_DAYS = 30;
+     
+    /// @notice Specify eShopId at point of contract creation, then it is fixed forever.
+    constructor (address contractAddressOfRegistry, string memory eShopIdString) public
     {
         addressRegistry = IAddressRegistry(contractAddressOfRegistry);
+        eShopId = stringToBytes32(eShopIdString);
     }
     
     // Contract setup
@@ -44,6 +50,15 @@ contract Purchasing is IPurchasing, Ownable, Bindable, StringConvertible
         // Funding contract
         funding = IFunding(addressRegistry.getAddressString(nameOfFunding));
         require(address(funding) != address(0), "Could not find Funding contract address in registry");
+        
+        // Check that the eShop master data purchasing contract points to this contract's address
+        IPoTypes.Eshop memory eShop = bpStorage.getEshop(eShopId);
+        require(eShop.purchasingContractAddress == address(this), "eShop master data points to wrong Purchasing address");
+    }
+    
+    function getFunding() override external view returns (IFunding)
+    {
+        return funding;
     }
     
     // Purchasing
@@ -52,42 +67,69 @@ contract Purchasing is IPurchasing, Ownable, Bindable, StringConvertible
         return poStorage.getPo(poNumber);
     }
     
-    function getPoBySellerAndQuote(string calldata sellerIdString, uint quoteId) override external view returns (IPoTypes.Po memory po)
+    function getPoByQuote(uint quoteId) override public view returns (IPoTypes.Po memory po)
     {
-        bytes32 sellerId = stringToBytes32(sellerIdString);
-        uint poNumber = poStorage.getPoNumberBySellerAndQuote(sellerId, quoteId);
+        uint poNumber = poStorage.getPoNumberByEshopIdAndQuote(eShopId, quoteId);
         return poStorage.getPo(poNumber);
     }
     
-    function createPurchaseOrder(IPoTypes.Po memory po) onlyRegisteredCaller() override public
+    function createPurchaseOrder(IPoTypes.Po memory po, bytes memory signature) onlyRegisteredCaller() override public
     {
         // Record the create request, emitting po exactly as we received it
-        emit PurchaseOrderCreateRequestLog(po.buyerAddress, po.sellerId, 0, po);
+        emit PurchaseOrderCreateRequestLog(po.buyerWalletAddress, po.sellerId, 0, po);
         
         //-------------------------------------------------------------------------
         // Po Validation (before new fields added)
         //-------------------------------------------------------------------------
-        // Ensure buyer chose a seller
-        require(po.sellerId.length > 0, "Seller Id must be specified");
-        // Ensure seller has a master data entry with approver address
+        // Ensure buyer chose a valid eshop
+        require(po.eShopId.length > 0, "eShopId must be specified");
+        IPoTypes.Eshop memory eShop = bpStorage.getEshop(po.eShopId);
+        require(eShop.purchasingContractAddress != address(0), "eShop has no purchasing address");
+        require(eShop.quoteSignerCount > 0, "No quote signers found for eShop");
+        require(po.eShopId == eShopId, "eShopId is not correct for this contract");  // must be "our" eShop
+        require(eShop.isActive == true, "eShop is inactive");
+        
+        // Ensure buyer chose a valid seller
+        require(po.sellerId.length > 0, "SellerId must be specified");
         IPoTypes.Seller memory seller = bpStorage.getSeller(po.sellerId);
-        require(seller.approverAddress != address(0), "Seller Id has no approver address");
-        // TODO validate quote and quote signer here
+        require(seller.sellerId.length > 0, "Seller has no master data");
+        require(seller.adminContractAddress != address(0), "Seller has no admin address");
+        require(seller.isActive == true, "Seller is inactive");
+        
+        // Validate quote and quote signer
+        address expectedSignerAddress = getSignerAddressFromPoAndSignature(po, signature);
+        bool isSignerFound = false;
+        address matchingSignerAddress = address(0);
+        for (uint i = 0; i < eShop.quoteSignerCount; i++)
+        {
+            if (eShop.quoteSigners[i] == expectedSignerAddress)
+            {
+                isSignerFound = true;
+                break;
+            }
+        }
+        require(isSignerFound == true, "Signature for quote does not match any expected signatures");
+        require(po.quoteExpiryDate >= now, "Quote expiry date has passed");
+        
+        // Quote should not already have been used
+        IPoTypes.Po memory poExisting = getPoByQuote(po.quoteId);
+        require(poExisting.poNumber == 0, "Quote already in use");
         
         //-------------------------------------------------------------------------
         // Add fields that contract owns
         //-------------------------------------------------------------------------
-        // Po header
         poStorage.incrementPoNumber();
         po.poNumber = poStorage.getCurrentPoNumber();
-        po.approverAddress = seller.approverAddress;
+        po.quoteSignerAddress = matchingSignerAddress;
         po.poCreateDate = now;
-        uint len = po.poItems.length;
-        po.poItemCount = uint8(len);
+        uint lenItems = po.poItems.length;
+        po.poItemCount = uint8(lenItems);
         for (uint i = 0; i < po.poItemCount; i++)
         {
             po.poItems[i].poNumber = po.poNumber;
             po.poItems[i].poItemNumber = (uint8)(i + 1);
+            // shop fee calculation - arbitrary 1% for now
+            po.poItems[i].currencyValueFee = ( po.poItems[i].currencyValue * FEE_BASIS_POINTS ) / 10000; 
             po.poItems[i].status = IPoTypes.PoItemStatus.Created;
             po.poItems[i].goodsIssuedDate = 0;
             po.poItems[i].goodsReceivedDate = 0;
@@ -96,6 +138,8 @@ contract Purchasing is IPurchasing, Ownable, Bindable, StringConvertible
             po.poItems[i].isEscrowReleased = false;
             po.poItems[i].cancelStatus = IPoTypes.PoItemCancelStatus.Initial;
         }
+        uint lenRules = po.rules.length;
+        po.rulesCount = uint8(lenRules);
         
         //-------------------------------------------------------------------------
         // Store Po details in eternal storage
@@ -109,7 +153,21 @@ contract Purchasing is IPurchasing, Ownable, Bindable, StringConvertible
         
         // Record the new PO as it was stored
         IPoTypes.Po memory poAsStored = poStorage.getPo(po.poNumber);
-        emit PurchaseOrderCreatedLog(poAsStored.buyerAddress, poAsStored.sellerId, poAsStored.poNumber, poAsStored);
+        emit PurchaseOrderCreatedLog(poAsStored.buyerWalletAddress, poAsStored.sellerId, poAsStored.poNumber, poAsStored);
+        
+        // Tell seller a new PO has arrive
+        ISellerAdmin sellerAdminContract = ISellerAdmin(seller.adminContractAddress);
+        sellerAdminContract.emitEventForNewPo(poAsStored);
+    }
+    
+    function getFeeBasisPoints() override external pure returns (uint)
+    {
+        return FEE_BASIS_POINTS;
+    }
+    
+    function getEscrowTimeoutDays() override external pure returns (uint)
+    {
+        return ESCROW_TIMEOUT_DAYS;
     }
     
     function cancelPurchaseOrderItem(uint poNumber, uint8 poItemNumber) onlyRegisteredCaller() override external
@@ -130,7 +188,7 @@ contract Purchasing is IPurchasing, Ownable, Bindable, StringConvertible
     
         // Write to storage
         poStorage.setPo(po);
-        emit PurchaseItemGoodsReceivedLog(po.buyerAddress, po.sellerId, po.poNumber, po.poItems[poItemIndex]);   
+        emit PurchaseItemGoodsReceivedLog(po.buyerWalletAddress, po.sellerId, po.poNumber, po.poItems[poItemIndex]);   
     }
     
     // Only from Seller Wallet
@@ -148,7 +206,7 @@ contract Purchasing is IPurchasing, Ownable, Bindable, StringConvertible
     
         // Write to storage
         poStorage.setPo(po);
-        emit PurchaseItemAcceptedLog(po.buyerAddress, po.sellerId, po.poNumber, po.poItems[poItemIndex]);
+        emit PurchaseItemAcceptedLog(po.buyerWalletAddress, po.sellerId, po.poNumber, po.poItems[poItemIndex]);
     }
     
     function setPoItemRejected(uint poNumber, uint8 poItemNumber) onlyRegisteredCaller() override external
@@ -160,14 +218,14 @@ contract Purchasing is IPurchasing, Ownable, Bindable, StringConvertible
         // Escrow refund, which could revert
         funding.transferOutFundsForPoItemToBuyer(poNumber, poItemNumber);
         uint poItemIndex = poItemNumber - 1;
-        emit PurchaseItemEscrowRefundedLog(po.buyerAddress, po.sellerId, po.poNumber, po.poItems[poItemIndex]);
+        emit PurchaseItemEscrowRefundedLog(po.buyerWalletAddress, po.sellerId, po.poNumber, po.poItems[poItemIndex]);
         
         // Updates
         po.poItems[poItemIndex].status = IPoTypes.PoItemStatus.Rejected;
     
         // Write to storage
         poStorage.setPo(po);
-        emit PurchaseItemRejectedLog(po.buyerAddress, po.sellerId, po.poNumber, po.poItems[poItemIndex]);
+        emit PurchaseItemRejectedLog(po.buyerWalletAddress, po.sellerId, po.poNumber, po.poItems[poItemIndex]);
     }
     
     function setPoItemReadyForGoodsIssue(uint poNumber, uint8 poItemNumber) onlyRegisteredCaller() override external
@@ -182,7 +240,7 @@ contract Purchasing is IPurchasing, Ownable, Bindable, StringConvertible
     
         // Write to storage
         poStorage.setPo(po);
-        emit PurchaseItemReadyForGoodsIssueLog(po.buyerAddress, po.sellerId, po.poNumber, po.poItems[poItemIndex]);
+        emit PurchaseItemReadyForGoodsIssueLog(po.buyerWalletAddress, po.sellerId, po.poNumber, po.poItems[poItemIndex]);
     }
     
     function setPoItemGoodsIssued(uint poNumber, uint8 poItemNumber) onlyRegisteredCaller() override external
@@ -195,11 +253,11 @@ contract Purchasing is IPurchasing, Ownable, Bindable, StringConvertible
         uint poItemIndex = poItemNumber - 1;
         po.poItems[poItemIndex].status = IPoTypes.PoItemStatus.GoodsIssued;
         po.poItems[poItemIndex].goodsIssuedDate = now;
-        po.poItems[poItemIndex].plannedEscrowReleaseDate = now + 30 days;   // TODO days to be configurable
+        po.poItems[poItemIndex].plannedEscrowReleaseDate = now + ESCROW_TIMEOUT_DAYS; // eg escrow times out after 30 days
     
         // Write to storage
         poStorage.setPo(po);
-        emit PurchaseItemGoodsIssuedLog(po.buyerAddress, po.sellerId, po.poNumber, po.poItems[poItemIndex]);
+        emit PurchaseItemGoodsIssuedLog(po.buyerWalletAddress, po.sellerId, po.poNumber, po.poItems[poItemIndex]);
     }
     
     function setPoItemGoodsReceivedSeller(uint poNumber, uint8 poItemNumber) onlyRegisteredCaller()  override external // TODO only seller and admin
@@ -219,7 +277,7 @@ contract Purchasing is IPurchasing, Ownable, Bindable, StringConvertible
     
         // Write to storage
         poStorage.setPo(po);
-        emit PurchaseItemGoodsReceivedLog(po.buyerAddress, po.sellerId, po.poNumber, po.poItems[poItemIndex]);
+        emit PurchaseItemGoodsReceivedLog(po.buyerWalletAddress, po.sellerId, po.poNumber, po.poItems[poItemIndex]);
     }
     
     function setPoItemCompleted(uint poNumber, uint8 poItemNumber) onlyRegisteredCaller() override external
@@ -231,7 +289,7 @@ contract Purchasing is IPurchasing, Ownable, Bindable, StringConvertible
         // Escrow release, which could revert
         funding.transferOutFundsForPoItemToSeller(poNumber, poItemNumber);
         uint poItemIndex = poItemNumber - 1;
-        emit PurchaseItemEscrowReleasedLog(po.buyerAddress, po.sellerId, po.poNumber, po.poItems[poItemIndex]);
+        emit PurchaseItemEscrowReleasedLog(po.buyerWalletAddress, po.sellerId, po.poNumber, po.poItems[poItemIndex]);
 
         // Updates        
         po.poItems[poItemIndex].status = IPoTypes.PoItemStatus.Completed;
@@ -240,7 +298,7 @@ contract Purchasing is IPurchasing, Ownable, Bindable, StringConvertible
     
         // Write to storage
         poStorage.setPo(po);
-        emit PurchaseItemCompletedLog(po.buyerAddress, po.sellerId, po.poNumber, po.poItems[poItemIndex]);
+        emit PurchaseItemCompletedLog(po.buyerWalletAddress, po.sellerId, po.poNumber, po.poItems[poItemIndex]);
     }
     
     function validatePoItem(IPoTypes.Po memory po, uint8 poItemNumber, IPoTypes.PoItemStatus expectedOldPoStatus) private pure
@@ -258,5 +316,43 @@ contract Purchasing is IPurchasing, Ownable, Bindable, StringConvertible
         
         // Status
         require(po.poItems[poItemIndex].status == expectedOldPoStatus, "Existing PO item status incorrect");
+    }
+    
+    //-------------------------------------------------------------------------
+    // Signature functions
+    //-------------------------------------------------------------------------
+    function getSignerAddressFromPoAndSignature(IPoTypes.Po memory po, bytes memory signature) override public pure returns (address)
+    {
+        // Recreate the message that was signed on the client
+        bytes32 messageAsClient = prefixed(keccak256(abi.encode(po)));
+        
+        // Recover the signer's address
+        return recoverSigner(messageAsClient, signature);
+    }
+    
+    function splitSignature(bytes memory sig) private pure returns (uint8 v, bytes32 r, bytes32 s)
+    {
+        require(sig.length == 65);
+        assembly {
+            // first 32 bytes, after the length prefix.
+            r := mload(add(sig, 32))
+            // second 32 bytes.
+            s := mload(add(sig, 64))
+            // final byte (first byte of the next 32 bytes).
+            v := byte(0, mload(add(sig, 96)))
+        }
+        return (v, r, s);
+    }
+
+    function recoverSigner(bytes32 message, bytes memory sig) private pure returns (address)
+    {
+        (uint8 v, bytes32 r, bytes32 s) = splitSignature(sig);
+        return ecrecover(message, v, r, s);
+    }
+
+    // builds a prefixed hash to mimic the behavior of eth_sign.
+    function prefixed(bytes32 hash) private pure returns (bytes32)
+    {
+        return keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", hash));
     }
 }
